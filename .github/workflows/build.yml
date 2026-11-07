@@ -1,0 +1,203 @@
+name: build-mr3000d-ci
+
+# ImmortalWrt 官方 ImageBuilder 25.12.2（内核 6.12.103）定制 MR3000D-CI 固件
+# 内核 6.12.103 < 6.12.109，规避官方 25.12.6 的 QCA8337 SGMII 网口全死回归
+# 预装：OpenClash + Mihomo 内核 + adblock + argon + 中文；预置旁路由配置
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 生成预置文件（旁路由配置脚本）
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults files/etc/openclash/core
+          cat > files/etc/uci-defaults/99-side-router.sh <<'SIDEROUTER'
+          #!/bin/sh
+          # MR3000D-CI 旁路由首次启动自动配置（主路由：锐捷天蝎 X60 Pro 192.168.110.1）
+          # 由固件预置，首次开机执行一次，成功后系统自动删除本文件。
+          # 注意：不改动 /etc/config/network 之外任何内核/分区相关内容，纯 UCI 配置。
+
+          # —— 1. LAN：静态 192.168.110.2，网关与 DNS 指向主路由（绝不能指向自己，否则环路）——
+          uci set network.lan.proto='static'
+          uci set network.lan.ipaddr='192.168.110.2'
+          uci set network.lan.netmask='255.255.255.0'
+          uci set network.lan.gateway='192.168.110.1'
+          uci -q delete network.lan.dns
+          uci add_list network.lan.dns='192.168.110.1'
+          uci -q delete network.lan.ip6assign
+          uci -q delete network.lan.ip6weight
+          uci set network.lan.delegate='0'
+
+          # —— 2. 删除 WAN 接口，把 wan 物理口并入 br-lan（四个口全部当 LAN 用）——
+          uci -q delete network.wan
+          uci -q delete network.wan6
+
+          BRDEV=$(uci show network | sed -n "s/^network\.\(@device\[[0-9]*\]\)\.name='br-lan'$/\1/p" | head -1)
+          if [ -n "$BRDEV" ]; then
+            case " $(uci -q get network.$BRDEV.ports) " in
+              *" wan "*) : ;;                                  # 已并入，幂等跳过
+              *) uci add_list network.$BRDEV.ports='wan' ;;
+            esac
+            logger -t side-router "merged wan port into $BRDEV"
+          fi
+          uci commit network
+
+          # —— 3. DHCP：旁路由接管发地址（主路由必须先关 DHCP，否则双 DHCP 冲突）——
+          uci set dhcp.lan.ignore='0'
+          uci set dhcp.lan.start='100'
+          uci set dhcp.lan.limit='150'
+          uci set dhcp.lan.leasetime='12h'
+          uci set dhcp.lan.ra='disabled'
+          uci set dhcp.lan.dhcpv6='disabled'
+          uci set dhcp.lan.ndp='disabled'
+          uci commit dhcp
+
+          # —— 4. 防火墙：lan 区开 masq（SNAT）保证回程不绕过；删掉 wan 区及其转发规则 ——
+          for z in $(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)=zone$/\1/p"); do
+            ZN=$(uci -q get firewall.$z.name)
+            if [ "$ZN" = "lan" ]; then
+              uci set firewall.$z.input='ACCEPT'
+              uci set firewall.$z.output='ACCEPT'
+              uci set firewall.$z.forward='ACCEPT'
+              uci set firewall.$z.masq='1'
+              uci set firewall.$z.mtu_fix='1'
+            fi
+            if [ "$ZN" = "wan" ]; then
+              uci -q delete firewall.$z
+            fi
+          done
+          for s in $(uci show firewall | sed -n "s/^firewall\.\(@forwarding\[[0-9]*\]\)=forwarding$/\1/p"); do
+            [ "$(uci -q get firewall.$s.src)" = "wan" ] && uci -q delete firewall.$s
+            [ "$(uci -q get firewall.$s.dest)" = "wan" ] && uci -q delete firewall.$s
+          done
+          uci commit firewall
+
+          # —— 5. 系统基础 ——
+          uci set system.@system[0].hostname='MR3000D-CI'
+          uci set system.@system[0].timezone='CST-8'
+          uci set system.@system[0].zonename='Asia/Shanghai'
+          uci commit system
+
+          # —— 6. 无线默认关闭（纯有线旁路由，减少变量；需要时在 LuCI 里打开）——
+          uci -q set wireless.radio0.disabled='1'
+          uci -q set wireless.radio1.disabled='1'
+          uci -q set wireless.default_radio0.disabled='1'
+          uci -q set wireless.default_radio1.disabled='1'
+          uci commit wireless
+
+          # 说明：此处不重启 network/dnsmasq。uci-defaults 在开机早期运行，
+          # 后续 rcS 会按新配置正常启动各服务；提前 restart 反而会与启动流程竞争。
+
+          exit 0
+          SIDEROUTER
+          chmod 0755 files/etc/uci-defaults/99-side-router.sh
+          sh -n files/etc/uci-defaults/99-side-router.sh && echo "shell syntax OK"
+          echo "--- 前 8 行 ---"
+          head -8 files/etc/uci-defaults/99-side-router.sh
+
+      - name: Download ImageBuilder 25.12.2 (kernel 6.12.103)
+        run: |
+          set -e
+          cd /tmp
+          BASE="https://downloads.immortalwrt.org/releases/25.12.2/targets/qualcommax/ipq50xx"
+          IB="immortalwrt-imagebuilder-25.12.2-qualcommax-ipq50xx.Linux-x86_64.tar.zst"
+          curl -fLO "$BASE/$IB"
+          curl -fsLO "$BASE/sha256sums"
+          grep "imagebuilder" sha256sums | sha256sum -c -
+          tar -I zstd -xf "$IB"
+          echo "=== 内核版本（必须 6.12.103）==="
+          cat immortalwrt-imagebuilder-25.12.2-qualcommax-ipq50xx.Linux-x86_64/version.buildinfo 2>/dev/null | head -5 || true
+
+      - name: Download Mihomo (Clash Meta) arm64 core
+        run: |
+          set -e
+          TAG=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)
+          echo "mihomo: $TAG"
+          curl -fLO "https://github.com/MetaCubeX/mihomo/releases/download/${TAG}/mihomo-linux-arm64-${TAG}.gz"
+          gunzip -f "mihomo-linux-arm64-${TAG}.gz"
+          mv "mihomo-linux-arm64-${TAG}" files/etc/openclash/core/clash_meta
+          chmod 0755 files/etc/openclash/core/clash_meta
+          ls -l files/etc/openclash/core/
+          echo "$TAG" > files/etc/openclash/core/version.txt
+          find files -type f | sort
+
+      - name: Build firmware
+        run: |
+          set -e
+          cd /tmp/immortalwrt-imagebuilder-25.12.2-qualcommax-ipq50xx.Linux-x86_64
+          # 不要加 -dnsmasq：默认即 dnsmasq-full，移除会导致无 DHCP/DNS
+          make image PROFILE=cmcc_mr3000d-ci \
+            PACKAGES="luci-i18n-base-zh-cn luci-theme-argon luci-app-argon-config luci-app-openclash luci-app-adblock luci-i18n-adblock-zh-cn" \
+            FILES="$GITHUB_WORKSPACE/files"
+          OUT=bin/targets/qualcommax/ipq50xx
+          ls -la "$OUT"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$OUT"/*cmcc_mr3000d-ci* "$GITHUB_WORKSPACE/out/"
+          cd "$GITHUB_WORKSPACE/out"
+          sha256sum * > custom-sha256sums.txt
+          cat custom-sha256sums.txt
+
+      - name: 编译后自检（体积 / 机型标记 / 预置文件 / 内核）
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/out"
+          LIMIT=60817408
+          FAIL=0
+          echo "=== 1. 体积 ==="
+          for f in *factory.ubi *sysupgrade.bin; do
+            [ -f "$f" ] || continue
+            SZ=$(stat -c%s "$f"); echo "$f : $SZ B ($((SZ*100/LIMIT))% of $LIMIT)"
+            [ "$SZ" -le "$LIMIT" ] || { echo "  超限"; FAIL=1; }
+          done
+          echo "=== 2. 机型标记 ==="
+          for f in *factory.ubi *sysupgrade.bin; do
+            [ -f "$f" ] || continue
+            N=$(grep -a -c 'cmcc_mr3000d-ci' "$f" || true); echo "$f : $N"
+            [ "$N" -gt 0 ] || { echo "  未命中"; FAIL=1; }
+          done
+          echo "=== 3. 预置文件是否入 rootfs ==="
+          ROOT=$(ls -d /tmp/immortalwrt-imagebuilder-*/build_dir/target-*/root-* 2>/dev/null | head -1)
+          if [ -n "$ROOT" ]; then
+            test -s "$ROOT/etc/openclash/core/clash_meta" && echo "  clash_meta $(stat -c%s "$ROOT/etc/openclash/core/clash_meta") B" || { echo "  clash_meta 缺失"; FAIL=1; }
+            test -x "$ROOT/etc/uci-defaults/99-side-router.sh" && echo "  uci-defaults OK" || { echo "  uci-defaults 缺失或不可执行"; FAIL=1; }
+          else
+            echo "  未找到 root staging（跳过）"
+          fi
+          echo "=== 4. 内核标记 ==="
+          grep -a -o '6\.12\.[0-9]\+' *sysupgrade.bin 2>/dev/null | sort -u | head -3 || true
+          [ "$FAIL" -eq 0 ] || { echo "自检失败"; exit 1; }
+          echo "全部通过"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mr3000d-ci-firmware
+          path: out/*
+          if-no-files-found: error
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: MR3000D-CI ImmortalWrt 25.12.2 build ${{ github.run_number }}
+          body: |
+            ImmortalWrt 25.12.2 / kernel 6.12.103 / profile cmcc_mr3000d-ci
+            预装 OpenClash + Mihomo 内核 + adblock + argon + 中文
+            预置旁路由 LAN 192.168.110.2 / 网关 192.168.110.1 / masq 开
+            刷法：先 factory.ubi（ubiformat），再 sysupgrade.bin
+          files: |
+            out/*cmcc_mr3000d-ci-squashfs-factory.ubi
+            out/*cmcc_mr3000d-ci-squashfs-sysupgrade.bin
+            out/custom-sha256sums.txt
